@@ -38,6 +38,19 @@ _FALLBACK_KEYSET = torch._C.DispatchKeySet(
 )
 
 
+def _is_hygon_compatible_device(device):
+    """Whether a tensor can be consumed by Hygon's HIP/Triton runtime.
+
+    Torch-FL exposes DCU tensors to PyTorch as PrivateUse1, renamed to
+    ``flagos``.  The underlying Hygon runtime uses the CUDA-compatible device
+    spelling, but both names refer to the same DCU allocation.  Treating a
+    flagos tensor as foreign sends an otherwise supported ``mul_`` to the
+    CompositeExplicitAutograd ``mul.out`` fallback, which has no executable
+    PrivateUse1 implementation.
+    """
+    return device.type in (_DEVICE_NAME, "flagos")
+
+
 def mul_get_configs():
     return [
         triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=3),
@@ -106,6 +119,38 @@ def mul_scalar_kernel(
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask)
+    out = x & scalar if IS_BOOL else x * scalar
+    tl.store(output_ptr + offsets, out, mask=mask)
+
+
+@libentry()
+@libtuner(
+    configs=mul_get_configs(),
+    key=["n_elements", "dtype"],
+    strategy=["align32", "default"],
+    warmup=5,
+    rep=20,
+    flagtune_op_name="mul",
+    flagtune_expand_op_name="mul",
+    flagtune_op_id="flaggems/mul",
+    flagtune_variant="tensor_scalar",
+    policy="flagtune",
+)
+@triton.jit
+def mul_tensor_scalar_kernel(
+    x_ptr,
+    scalar_ptr,
+    output_ptr,
+    n_elements,
+    dtype: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    IS_BOOL: tl.constexpr,
+):
+    """Multiply contiguous ``x`` by a 0-D tensor stored on the device."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    scalar = tl.load(scalar_ptr)
     out = x & scalar if IS_BOOL else x * scalar
     tl.store(output_ptr + offsets, out, mask=mask)
 
@@ -545,6 +590,24 @@ def _launch_scalar(tensor, scalar, output, dtype):
     return output
 
 
+def _launch_tensor_scalar(tensor, scalar, output, dtype):
+    """Launch the contiguous 0-D Tensor scalar variant without redispatch."""
+    n_elements = output.numel()
+    if n_elements == 0:
+        return output
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    with torch_device_fn.device(output.device):
+        mul_tensor_scalar_kernel[grid](
+            tensor,
+            scalar,
+            output,
+            n_elements,
+            dtype=_dtype_name(dtype),
+            IS_BOOL=_is_bool_dtype(dtype),
+        )
+    return output
+
+
 def _launch_2d_broadcast(
     a_t, b_t, output, out_shape, a_stride, b_stride, out_stride, dtype
 ):
@@ -622,7 +685,7 @@ def mul_broadcast_func(a, b, out=None):
         raise TypeError("mul expects tensor or scalar inputs")
 
     device = _select_device(a, b)
-    if device.type != _DEVICE_NAME:
+    if not _is_hygon_compatible_device(device):
         if out is not None:
             return torch.ops.aten.mul.out.redispatch(_FALLBACK_KEYSET, a, b, out=out)
         return torch.ops.aten.mul.Tensor.redispatch(_FALLBACK_KEYSET, a, b)
@@ -652,6 +715,13 @@ def mul_broadcast_func(a, b, out=None):
     a_t = _as_tensor(a, device=device, dtype=dtype)
     b_t = _as_tensor(b, device=device, dtype=dtype)
     output = _real_output(a_t, b_t, out=out)
+
+    # A same-device 0-D tensor needs a pointer load, rather than the Python
+    # scalar ABI used by ``mul_scalar_kernel``.  Keep it out of the generic ND
+    # path, whose runtime metadata launch is unnecessary for a contiguous
+    # in-place result and is not reliable on current HCU Triton.
+    if b_t.ndim == 0 and _can_use_contiguous_scalar(a_t, output):
+        return _launch_tensor_scalar(a_t, b_t, output, dtype)
 
     if _can_use_contiguous_tensor_tensor(a_t, b_t, output):
         return _launch_contiguous_tensor_tensor(a_t, b_t, output, dtype)
@@ -767,7 +837,7 @@ def _launch_complex_generic(
 
 def mul_complex_broadcast_func(a, b, out=None):
     device = _select_device(a, b)
-    if device.type != _DEVICE_NAME:
+    if not _is_hygon_compatible_device(device):
         if out is not None:
             return torch.ops.aten.mul.out.redispatch(_FALLBACK_KEYSET, a, b, out=out)
         return torch.ops.aten.mul.Tensor.redispatch(_FALLBACK_KEYSET, a, b)

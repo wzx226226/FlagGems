@@ -123,6 +123,25 @@ def test_mul_tensor_scalar_(shape, scalar, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 
+@pytest.mark.mul_
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "hygon",
+    reason="Covers the Hygon device 0-D tensor fast path",
+)
+@pytest.mark.parametrize("shape", [(32,), (2, 3, 4, 5)])
+def test_hygon_mul_tensor_device_scalar_inplace_preserves_storage(shape):
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
+    scale = torch.tensor(0.25, dtype=inp.dtype, device=flag_gems.device)
+    expected = utils.to_reference(inp, True) * utils.to_reference(scale, True)
+    before_ptr = inp.data_ptr()
+
+    with flag_gems.use_gems():
+        result = inp.mul_(scale)
+
+    utils.gems_assert_close(result, expected, inp.dtype)
+    assert result.data_ptr() == before_ptr == inp.data_ptr()
+
+
 @pytest.mark.mul
 @pytest.mark.parametrize(
     "shape_a, shape_b",
